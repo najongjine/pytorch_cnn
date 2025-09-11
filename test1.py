@@ -259,6 +259,18 @@ def explain_and_visualize_one(xb_cpu):
         show_feature_map(conv2[0].detach().cpu(), "Conv2 Output: More Complex Patterns")
         show_feature_map(conv3[0].detach().cpu(), "Conv3 Output: Combined Features (e.g., ears, nose, whiskers)")
 
+        h1_img = h1.squeeze().cpu().numpy().reshape(8, 16)  # or (16,8)
+        plt.figure(figsize=(6, 3))
+        plt.imshow(h1_img, cmap='viridis')
+        plt.title("Linear(64*16*16 → 128) Output as Image")
+        plt.colorbar()
+        plt.axis("off")
+        plt.tight_layout()
+        plt.show()
+
+        
+
+
 
 
 # -----------------------
