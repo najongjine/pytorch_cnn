@@ -16,6 +16,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, random_split
 from torchvision import datasets, transforms
+import torch.nn.functional as F
 
 # -----------------------
 # 0) 설정
@@ -207,6 +208,112 @@ def show_feature_map(chw, title="Feature Map", max_channels=MAX_CH, ncols=8):
     plt.show()
 
 @torch.no_grad()
+def visualize_conv_kernels(layer_idx=0):
+    # layer_idx: 0=Conv1, 4=Conv2, 8=Conv3 (현재 모델 features 인덱스)
+    conv = model.features[layer_idx]
+    W = conv.weight.detach().cpu()            # (out, in, kh, kw)
+    Wm = W.mean(dim=1)                        # RGB 평균 → 1채널로 간단 확인
+    C, H, Wk = Wm.shape
+    ncols = 8; nrows = (C + ncols - 1) // ncols
+    import matplotlib.pyplot as plt
+    plt.figure(figsize=(ncols*2, nrows*2))
+    for i in range(C):
+        k = Wm[i]
+        k = (k - k.min()) / (k.max() - k.min() + 1e-8)
+        ax = plt.subplot(nrows, ncols, i+1)
+        ax.imshow(k.numpy(), cmap="gray"); ax.axis("off")
+    plt.suptitle(f"Conv kernels @ layer_idx={layer_idx}")
+    plt.tight_layout(); plt.show()
+
+def _denorm_img(img3chw):
+    mean = torch.tensor([0.5,0.5,0.5], device=img3chw.device).view(3,1,1)
+    std  = torch.tensor([0.5,0.5,0.5], device=img3chw.device).view(3,1,1)
+    return (img3chw*std + mean).clamp(0,1).permute(1,2,0).cpu().numpy()
+
+def overlay_topk_activations(xb_cpu, fmap, k=6, title=""):
+    """xb_cpu: (1,3,H,W) 원본, fmap: (1,C,h,w) 해당 레이어 출력"""
+    x_np = _denorm_img(xb_cpu[0])
+    A = fmap.detach().cpu()[0]               # (C,h,w)
+    # 채널별 평균 활성도가 큰 k개 선택
+    scores = A.view(A.shape[0], -1).mean(dim=1)
+    topk = torch.topk(scores, k=min(k, A.shape[0]))[1].tolist()
+
+    H, W = xb_cpu.shape[2], xb_cpu.shape[3]
+    ncols = 3; nrows = (len(topk) + ncols - 1)//ncols
+    plt.figure(figsize=(ncols*4, nrows*4))
+    for i, ch in enumerate(topk):
+        act = A[ch:ch+1]                     # (1,h,w)
+        act = act - act.min()
+        act = act / (act.max() + 1e-8)
+        act_up = F.interpolate(act.unsqueeze(0), size=(H,W), mode="bilinear", align_corners=False)[0,0].numpy()
+
+        # overlay
+        heat = plt.cm.jet(act_up)[..., :3]   # (H,W,3)
+        mix = (0.5*x_np + 0.5*heat)
+        ax = plt.subplot(nrows, ncols, i+1)
+        ax.imshow(mix); ax.set_title(f"{title} ch={ch}"); ax.axis("off")
+    plt.tight_layout(); plt.show()
+
+def forward_to_idx(x, last_idx):
+    y = x
+    for i in range(last_idx+1):
+        y = model.features[i](y)
+    return y
+
+# Grad-CAM for last conv block (relu3 @ features[10])
+def grad_cam(xb_cpu, class_idx=None):
+    model.eval()
+    torch.set_grad_enabled(True)                 # 혹시 모를 no_grad 상태 해제
+    for p in model.parameters():
+        p.requires_grad_(True)                   # 파라미터 grad 허용
+
+    feats = None
+    grads = None
+
+    def fwd_hook(m, i, o):
+        nonlocal feats; feats = o                # (B,C,h,w)
+    def bwd_hook(g):
+        nonlocal grads; grads = g                # (B,C,h,w)
+
+    # 마지막 conv 뒤 ReLU 출력에 훅(당신 모델에선 features[10] = ReLU3)
+    h1 = model.features[10].register_forward_hook(fwd_hook)
+    h2 = model.features[10].register_full_backward_hook(lambda m, gin, gout: bwd_hook(gout[0]))
+
+    # ⚠️ leaf 텐서로 만들어서 requires_grad=True
+    x = xb_cpu.to(DEVICE)
+    x = x.clone().detach().requires_grad_(True)
+
+    logits = model(x)                            # (B,num_classes)
+    if class_idx is None:
+        class_idx = int(logits.argmax(dim=1)[0])
+    score = logits[0, class_idx]                 # 그래프에 연결된 0-dim tensor
+
+    model.zero_grad()
+    score.backward(retain_graph=False)           # ← 이제 grad_fn 존재
+
+    h1.remove(); h2.remove()
+
+    # 채널 가중치: d(score)/d(feats) 의 GAP
+    w = grads[0].detach().cpu().mean(dim=(1,2))  # (C,)
+    cam = (w.view(-1,1,1) * feats[0].detach().cpu()).sum(dim=0)
+    cam = torch.relu(cam)
+    cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
+
+    H, W = xb_cpu.shape[2], xb_cpu.shape[3]
+    cam_up = F.interpolate(cam.unsqueeze(0).unsqueeze(0),
+                           size=(H, W), mode="bilinear",
+                           align_corners=False)[0,0].numpy()
+
+    img = _denorm_img(xb_cpu[0])
+    heat = plt.cm.jet(cam_up)[..., :3]
+    mix = 0.4*img + 0.6*heat
+    plt.figure(figsize=(4,4))
+    plt.imshow(mix); plt.title(f"Grad-CAM (class={classes[class_idx]})")
+    plt.axis("off"); plt.show()
+
+
+
+@torch.no_grad()
 def explain_and_visualize_one(xb_cpu):
     model.eval()
     with torch.no_grad():
@@ -253,6 +360,24 @@ def explain_and_visualize_one(xb_cpu):
 
         import matplotlib.pyplot as plt
         plt.figure(figsize=(3,3)); plt.imshow(inv); plt.title("input image(recover)"); plt.axis("off"); plt.show()
+
+        # 1층 커널 모양
+        visualize_conv_kernels(0)
+
+        # 레이어별 top-k 활성화 오버레이
+        xb_vis, _ = next(iter(val_loader))
+        xb1 = xb_vis[:1]
+        conv1 = forward_to_idx(xb1.to(DEVICE), 0)
+        conv2 = forward_to_idx(xb1.to(DEVICE), 4)
+        conv3 = forward_to_idx(xb1.to(DEVICE), 8)
+        overlay_topk_activations(xb1, conv1, k=6, title="Conv1")
+        overlay_topk_activations(xb1, conv2, k=6, title="Conv2")
+        overlay_topk_activations(xb1, conv3, k=6, title="Conv3")
+
+        # 최종 분류 근거 위치
+        grad_cam(xb1)
+
+
 
         show_feature_map(conv1[0].detach().cpu(), "Conv1 Output: Edges / Dots / Simple Patterns")
         show_feature_map(pool1[0].detach().cpu(), "Pool1 Output: Reduced Resolution, Summarized")
